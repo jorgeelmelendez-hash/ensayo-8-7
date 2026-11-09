@@ -1,0 +1,5 @@
+version: 1
+project: "p6jatyj67d9"
+environments:
+  production:
+    branch: "main"
