@@ -1,0 +1,105 @@
+name: plataforma
+run-name: "plataforma build ${{ inputs.build_id }}"
+"on":
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+permissions:
+  id-token: write
+  contents: read
+concurrency:
+  group: "plataforma-${{ github.ref }}"
+  cancel-in-progress: false
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # The platform dispatched this run for one exact commit. Only that commit
+      # is checked out, and the checkout keeps no credential behind: everything
+      # after it talks to the platform with the deploy token and never with the
+      # repository's own git credentials.
+      - name: Check out the commit the platform built
+        uses: actions/checkout@v4
+        with:
+          ref: "${{ inputs.sha }}"
+          persist-credentials: false
+      # ---- BUILD: this step is yours to edit ---------------------------------
+      # It is the one thing the platform cannot know: how this project is built.
+      # The default below is the catalogue's default for the runtime this
+      # project declares, and changing it is expected rather than exceptional.
+      - name: Build (edit me)
+        run: |
+          true
+      # ---- everything below this line is the platform's ----------------------
+      - name: Exchange this run's identity for a deploy token
+        env:
+          PLATFORM: "https://plataforma.lupaterra.com"
+          AUDIENCE: "https://plataforma.lupaterra.com"
+          BUILD_ID: "${{ inputs.build_id }}"
+        run: |
+          set -euo pipefail
+          ID_TOKEN=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -r .value)
+          echo "::add-mask::$ID_TOKEN"
+          body=$(jq -n --arg b "$BUILD_ID" --arg t "$ID_TOKEN" '{build_id:$b,id_token:$t}')
+          resp=$(curl -sS -w '\n%{http_code}' -X POST "$PLATFORM/v1/ci/exchange" \
+            -H 'Content-Type: application/json' --data-binary "$body")
+          code=$(tail -n1 <<<"$resp"); json=$(head -n -1 <<<"$resp")
+          echo "exchange: $code"; test "$code" = 200
+          TOKEN=$(jq -r .token <<<"$json")
+          echo "::add-mask::$TOKEN"
+          echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          echo "PLATFORM=$PLATFORM" >> "$GITHUB_ENV"
+          echo "PROJECT=$(jq -r .project <<<"$json")" >> "$GITHUB_ENV"
+      - name: "Deploy the site"
+        env:
+          OUTPUT_DIR: "dist"
+          SERVICE: ""
+          SHA: "${{ inputs.sha }}"
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/manifest.json"
+          artifact="$RUNNER_TEMP/artifact.tgz"
+          if [ -n "$SERVICE" ]; then
+            jq -n --arg p "$PROJECT" --arg s "$SERVICE" --arg sha "$SHA" \
+              '{project:$p,environment:"production",service:$s,sha:$sha,source:"ci",actor:"github-actions"}' > "$manifest"
+          else
+            jq -n --arg p "$PROJECT" --arg sha "$SHA" \
+              '{project:$p,environment:"production",sha:$sha,source:"ci",actor:"github-actions"}' > "$manifest"
+          fi
+          # The platform refuses any symbolic link in an artifact. npm leaves its
+          # command shims in node_modules/.bin as links, and nothing at runtime can
+          # use them: a start command begins with an interpreter or an absolute
+          # path. Any other link is named here, before the upload.
+          if [ -d "$OUTPUT_DIR/node_modules" ]; then
+            find "$OUTPUT_DIR/node_modules" -type d -name .bin -prune -exec rm -rf {} +
+          fi
+          links=$(find "$OUTPUT_DIR" \( -name .git -o -name .plataforma -o -name .env -o -name '.env.*' \) -prune -o -type l -print)
+          if [ -n "$links" ]; then
+            echo "the artifact contains symbolic links, which the platform refuses:"
+            printf '%s\n' "$links"
+            exit 1
+          fi
+          tar czf "$artifact" --exclude='.git' --exclude='.plataforma' --exclude='.env' --exclude='.env.*' \
+            -C "$OUTPUT_DIR" .
+          body="$RUNNER_TEMP/deploy-body.json"
+          code=$(curl -sS -o "$body" -w '%{http_code}' -X POST "$PLATFORM/v1/deploy" \
+            -H "Authorization: Bearer $TOKEN" \
+            -F 'manifest=@'"$manifest"';type=application/json' \
+            -F 'artifact=@'"$artifact"';type=application/gzip')
+          echo "deploy${SERVICE:+ $SERVICE}: $code"
+          # A 4xx body is the platform's own refusal text and a 5xx body is fixed
+          # text, so printing it tells the operator WHY the deploy was refused
+          # instead of leaving a bare status in the run's log (task 7.14a: a
+          # failed health check after the restart answers 422 with a sentence
+          # naming the service and the SHAs).
+          if [ "$code" != 201 ]; then
+            cat "$body"
+            exit 1
+          fi
+
